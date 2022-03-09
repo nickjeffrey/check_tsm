@@ -1,0 +1,1370 @@
+#!/usr/bin/perl -w
+
+
+#
+# Nagios plugin for performing checks against TSM server
+#
+
+# HINT: update the contents of the following variables: $tsmuser $tsmpass $tsmserver $library_name 
+#       By hardcoding these values to match your environment, you can avoid providing those as command line parameters
+
+
+
+# CHANGE LOG
+# ----------
+# 2006/11/23	njeffrey		# script created
+# 2007/10/03	njeffrey		#change CHECK_NAME to "TSM checks"
+# 2007/10/03	njeffrey		#TSM 5.3 and above requires a writable error log.  Add -errorlogname=/dev/null to dsmadmc command 
+# 2009/06/22	njeffrey		#Add comments and notes 
+# 2009/06/22	njeffrey		#change CHECK_NAME to "TSM Checks"
+# 2009/06/22	njeffrey		#Combine separate checks for TSM log/db/etc 
+# 2009/06/23	njeffrey		#Add checks for TSM drives, drive paths, scratch tapes
+# 2009/06/23	njeffrey		#Add check for failed client schedules
+# 2011/01/11	njeffrey		#Add verbose=yes switch for debugging
+# 2011/01/11	njeffrey		#combine tsm_db_util  and tsm_db_util_6 subroutines into a single subroutine
+# 2011/01/11	njeffrey		#combine tsm_log_util and tsm_db_util_6 subroutines into a single subroutine
+# 2011/01/11	njeffrey		#add assorted error checks
+# 2011/01/11	njeffrey		#update notes section
+# 2012/02/21	njeffrey		#add section for ORACLE_ARCHLOG backups
+# 2012/07/06	njeffrey		#add check for tape media errors
+# 2012/07/24	njeffrey		#add check for low disk space in diagpath (usually /home/tsminst1/sqllib/db2dump)
+# 2012/07/24	njeffrey		#add check for low disk space in database home directory (usually /home/tsminst1/tsminst1)
+# 2012/09/14	njeffrey		#add check for errors in the RECLAIM script
+# 2012/09/14	njeffrey		#add check for errors in any TSM administrative script (ie the "run reclaim" admin schedules)
+# 2012/09/14	njeffrey		#add check for "Critical TapeAlert" message in the TSM actlog
+# 2013/02/19	njeffrey		#add check for low number of free slots in library
+# 2013/03/11	njeffrey		#do not alert on low free slots if there are lots of scratch tapes
+# 2013/03/11	njeffrey		#add check_cleaningtape_status subroutine
+# 2013/11/24	njeffrey		#look in TSM activity log: ANR8942E Could not move volume ???? from slot-element ### to slot-element ###
+# 2013/11/24	njeffrey		#look in TSM activity log: ANR8381E LTO volume NL5217L4 could not be mounted in drive DRIVE3
+# 2013/11/24    njeffrey       		#Add error check to confirm only a single instance of this script is running at a time
+# 2015/03/12    njeffrey       		#Add support for TSM server 7.x
+# 2015/06/09    njeffrey       		#Add more error checks to check_tape_library_free_slots subroutine
+# 2016/02/08    njeffrey       		#Add more detail to error message in check_tsm_unavailable_tapes subroutine
+# 2018/02/13    njeffrey       		#Add support for TSM server 8.x
+# 2018/06/22    njeffrey       		#Add subroutine check_buffer_pool_hit_ratio
+# 2018/06/22    njeffrey       		#Move all the alerts into the print_output subroutine.  This gathers all the info before sending an alert.
+# 2019/05/21    njeffrey       		#Script takes too long to run and times out.  Run as scheduled cron job and have nagios read an output file.
+# 2022/03/07    njeffrey       		#Add get_options subroutine
+
+
+
+
+# NOTES
+# -----
+#  This script should return one (and only one) line of ouput.  Multiple
+#  lines of output are silently ignored by nagios.
+#
+#  The line of output will become the body of the alert message sent by nagios
+#
+#
+#  It is assumed that this script is being executed directly on your nagios server from
+#  the /usr/local/nagios/libexec/check_tsm file.
+#  It is assumed that the nagios server has the TSM client installed (specifically the dsmadmc command).  
+#  If this check is running locally on the nagios server, you should have a section similar 
+#  to the following in the services.cfg file:
+#     define service{
+#             use                             generic-14x7-service
+#             host_name                       tsmserv01
+#             service_description             TSM checks
+#             check_command                   check_tsm
+#             }
+#  And a section similar to the following in the commands.cfg file:
+#      # 'check_tsm' command definition
+#      define command{
+#             command_name    check_tsm
+#             command_line    $USER1$/check_tsm
+#             }
+#
+#
+#
+#  You may wish to run this script directly on the TSM server instead of the nagios server.
+#  Why would you want to do that?  Maybe your nagios server does not have the TSM client installed.
+#  Anyway, if you do want to execute this script remotely on the TSM server instead of the nagios server,
+#  you may use the check_by_ssh or check_nrpe plugins to do so.
+#
+#  If you are using the check_by_ssh method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#      define service {
+#              use                             generic-24x7-service
+#              host_name       	               tsmserv01
+#              service_description             TSM checks
+#              check_command                   check_by_ssh!/usr/local/nagios/libexec/check_tsm
+#              }
+#
+#
+#  Alternatively, if you are using the NRPE method, you should have a section similar to the following in
+#  the services.cfg file:
+#      define service{
+#               use                             generic-24x7-service
+#               host_name                       tsmserv01
+#               service_description             TSM checks
+#               check_command                   check_nrpe!/usr/local/nagios/libexec/check_tsm
+#  If you are using the NRPE method, you will also need a command definition similar to the following on each monitored host
+#  in the /usr/local/nagios/nrpe/nrpe.cfg file:
+#      command[check_tsm]=/usr/local/nagios/libexec/check_tsm stats stats123 CAL1SP 90 95
+#
+#
+#
+# It is assumed that this script is also run as a cron job by the nagios user.  For example:
+# This script runs as a cron job so it can write to a temporary file, to avoid nagios timeouts for long-running scripts
+# 1,16,31,46 * * * * /usr/local/nagios/libexec/check_tsm >/dev/null 2>&1  #save TSM check results to temporary file to avoid timeouts
+
+
+
+# TROUBLESHOOTING
+# ---------------
+#
+#   This script assumes the TSM admin command line tool (dsmadmc) is available on the nagios server (or TSM server if being run there)
+#
+#   This script assumes a TSM administrator called $tsmuser exists.  You must create this account
+#   on the TSM server with:   register admin $tsmuser $tsmpass
+#                             grant authority username CLasses=SYstem     (required to run "show slots" command)
+#
+#  Note that the $tsmserver variable is the instance name of the TSM server, not the hostname.
+#   ie the value set from:   dsmadmc -id=$tsmuser -password=$tsmpass update server $tsmserver
+#
+# If the script does not detect the number of slots in the library, check the $library_name variable
+
+
+use diagnostics;                                #tell the perl interpreter to give us verbose messages while debugging
+use strict;                                     #enforce good coding practices
+use Getopt::Long;     				#allow --long-switches to be used as parameters
+
+
+# define variables
+my ($dsmadmc,$ps,$CHECK_NAME,$tsmuser,$tsmpass,$tsmserver,$tsmlog_util,$tsmlog_maxutil,$tsmlog_warn,$tsmlog_crit,$tsmdb_util,$tsmdb_maxutil,$tsmdb_warn,$tsmdb_crit);
+my ($tsm_db_buffer_pool_hit_ratio);
+my ($cmd,$OK,$WARN,$CRITICAL,$UNKNOWN,$verbose,$tsm_version);
+my ($tsm_drives_online,$tsm_drives_offline,$tsm_drives_crit,$tsm_drives_warn);
+my ($tsm_scratchtapes,$tsm_scratch_warn,$tsm_scratch_crit);
+my ($tsm_readonlytapes,$tsm_readonly_crit,$tsm_readonly_warn);
+my ($tsm_unavailabletapes,$tsm_unavailable_crit,$tsm_unavailable_warn);
+my ($tsm_paths_online,$tsm_paths_offline,$tsm_paths_crit,$tsm_paths_warn);
+my ($client_schedule_completed,$client_schedule_failed,$client_schedule_failed_crit,$client_schedule_failed_warn);
+my ($client_schedule_missed,$client_schedule_missed_crit,$client_schedule_missed_warn);
+my ($admin_schedule_completed,$admin_schedule_failed,$admin_schedule_failed_crit,$admin_schedule_failed_warn);
+my ($admin_schedule_missed,$admin_schedule_missed_crit,$admin_schedule_missed_warn);
+my ($tsm_actlog_dirty,$tsm_actlog_clean,$tsm_actlog_messages);
+my ($tsm_cleaningtapes,$cleanings_left,$cleanings_left_crit,$cleanings_left_warn);
+my ($library_name,$library_totalslots,$library_usedslots,$library_cleaningslots,$library_cleaningslots_warn,$library_freeslots,$library_freeslots_warn);
+my ($instances,$common_output_data,$outputfile,$output_message);
+my ($epoch,$dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
+my ($opt_h,$opt_v,$opt_u,$opt_p,$opt_s,$opt_l);
+#
+#
+$dsmadmc                      = "/usr/bin/dsmadmc";	#location of dsmadmc binary
+$ps                           = "/usr/bin/ps";		#location of ps binary
+$CHECK_NAME                   = "TSM checks";		#define name of nagios check
+$tsmuser                      = "scripts";		#username for connecting to TSM server with dsmadmc - adjust for your environment
+$tsmpass                      = "XXXXXXX";		#password to connect to TSM - adjust for your environment
+$tsmserver                    = "XXXXXXX";		#name of TSM server (not hostname, but as defined in TSM) - adjust for your environment
+$library_name                 = "LTOLIB1";		#name of tape library (if one exists).  Get name with: dsmadmc ; query library
+$library_totalslots           = 0;			#initialize variable
+$library_usedslots            = 0;			#initialize variable
+$library_freeslots            = 0;			#initialize variable
+$library_freeslots_warn       = 4;			#alert if there are less than this many free slots in library
+$library_cleaningslots        = "unknown";		#start with a value of "unknown", change when cleaning slots are detected
+$library_cleaningslots_warn   = 2;			#alert if there are less than this many cleaning tapes in library
+$tsm_cleaningtapes            = 0;			#initialize variable
+$cleanings_left               = 0;			#holds total number of cleaning cycles left on all cleaning tapes
+$cleanings_left_warn          = 50;			#warn when there are only 40 cleaning cycles left (one tape holds 50 cycles)
+$cleanings_left_crit          = 25;			#critical when down to 30 cleaning cycles - really need to order new tapes
+$tsmlog_util                  = "";			#current utilization of TSM log
+$tsmlog_maxutil               = "";			#maximum recorded utilization of TSM log
+$tsmlog_warn                  = 90;			#threshhold percentage util for warning message
+$tsmlog_crit                  = 95;			#threshhold percental util for critical message
+$tsmdb_util                   = "";			#current utilization of TSM database
+$tsmdb_maxutil                = "";			#maximum recorded utilization of TSM database
+$tsmdb_warn                   = 90;			#threshhold percentage util for warning message
+$tsmdb_crit                   = 95;			#threshhold percental util for critical message
+$tsm_db_buffer_pool_hit_ratio = 0;			#initialize variable
+$tsm_drives_online            = ""; 			#number of TSM tape drives online
+$tsm_drives_offline           = ""; 			#number of TSM tape drives offline
+$tsm_scratchtapes             = 0;			#number of scratch tapes currently in library
+$tsm_scratch_warn             = 10;			#alert if there are less than this many scratch tapes
+$tsm_scratch_crit             = 5;			#alert if there are less than this many scratch tapes
+$tsm_readonlytapes            = 0;			#number of scratch tapes currently in library
+$tsm_readonly_warn            = 1;			#alert if there are more than this many readonly tapes
+$tsm_readonly_crit            = 5;			#alert if there are more than this many readonly tapes
+$tsm_unavailabletapes         = "";			#number of scratch tapes currently in library
+$tsm_unavailable_warn         = 1;			#alert if there are more than this many unavailable tapes
+$tsm_unavailable_crit         = 5;			#alert if there are more than this many unavailable tapes
+$tsm_paths_online             = ""; 			#number of TSM tape drives online
+$tsm_paths_offline            = ""; 			#number of TSM tape drives offline
+$tsm_paths_warn               = 1;			#warning alert  if this many paths  fail
+$tsm_paths_crit               = 2;			#critical alert if this many paths  fail
+$tsm_drives_warn              = 1;			#warning alert  if this many drives fail
+$tsm_drives_crit              = 2;			#critical alert if this many drives fail
+$client_schedule_completed    = 0; 			#initialize variable
+$client_schedule_failed       = 0;			#initialize variable
+$client_schedule_missed       = 0;			#initialize variable
+$client_schedule_failed_crit  = 15;			#critical alert when this many schedules failed
+$client_schedule_failed_warn  = 5;			#warning  alert when this many schedules failed
+$client_schedule_missed_crit  = 15;			#critical alert when this many schedules missed
+$client_schedule_missed_warn  = 5;			#warning  alert when this many schedules missed
+$admin_schedule_completed    = 0; 			#initialize variable
+$admin_schedule_failed       = 0;			#initialize variable
+$admin_schedule_missed       = 0;			#initialize variable
+$admin_schedule_failed_crit  = 4;			#critical alert when this many schedules failed
+$admin_schedule_failed_warn  = 2;			#warning  alert when this many schedules failed
+$admin_schedule_missed_crit  = 4;			#critical alert when this many schedules missed
+$admin_schedule_missed_warn  = 1;			#warning  alert when this many schedules missed
+$verbose                     = "no";			#yes/no switch to enable verbose output mode for debugging
+$tsm_version                 = "";			#version of TSM server
+$tsm_actlog_dirty            = "/tmp/tsmactlog.dirty";	#temporary file for working copy of TSM activity log
+$tsm_actlog_clean            = "/tmp/tsmactlog.clean";	#temporary file for working copy of TSM activity log after cleaning up multi-line log entries
+$tsm_actlog_messages         = "";			#scalar variable to hold any interesting messages found in the TSM activity log
+
+#
+# Nagios return codes
+#
+$OK=0;
+$WARN=1;
+$CRITICAL=2;
+$UNKNOWN=3;
+
+
+
+sub split_csv {
+   #
+   # This subroutine takes the output of a dsmadmc command that is in CSV format and cleans it up so the values can be shoved into variables
+   # All the calls to this subroutine were removed during a rework of this script in Jan 2011, but this subroutine is being left in 
+   # just in case we want to re-use it in the future.
+   #
+   print "running split_csv subroutine \n" if ($verbose eq "yes");
+   #
+   my $text = shift;
+   my @new = ();
+   push(@new, $+) while $text =~ m{ \s*(
+      # groups the phrase inside double quotes
+      "([^\"\\]*(?:\\.[^\"\\]*)*)"\s*,?
+      # groups the phrase inside single quotes
+      | '([^\'\\]*(?:\\.[^\'\\]*)*)'\s*,?
+      # trims leading/trailing space from phrase
+      | ([^,\s]+(?:\s+[^,\s]+)*)\s*,?
+      # just to grab empty phrases
+      | (),
+      )\s*}gx;
+   push(@new, undef) if $text =~ m/,\s*$/;
+   #
+   # just to prove it's working
+   if ($verbose eq "yes") {
+      print "string: >>$text<<\n";
+      foreach (@new) {
+          print " part: >>" . (defined($_) ? $_ : '') . "<<\n";
+      }
+   }      
+   return @new;
+}
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   #
+   print "running get_options subroutine \n" if ($verbose eq "yes");
+   #
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"           => \$opt_h,
+      "v"   => \$opt_v, "verbose"        => \$opt_v,
+      "u=s" => \$opt_u, "tsmuser=s"      => \$opt_u,  
+      "p=s" => \$opt_p, "tsmpass=s"      => \$opt_p, 
+      "s=s" => \$opt_s, "tsmserver=s"    => \$opt_s,
+      "l=s" => \$opt_l, "library_name=s" => \$opt_l,
+   );
+   #
+   #
+   #
+   # If the user supplied -h or --help, generate the help messages
+   if( defined( $opt_h ) ) {
+      print "Nagios plugin for checking IBM TSM / Spectrum Protect Server health \n";
+      print "Examples: \n";
+      print "   $0 --help    \n";
+      print "   $0 --verbose \n";
+      print "   $0 --tsmuser=SomeUser --tsmpass=SomePass --tsmserver=SomeServer \n";
+      print "\n\n";
+      exit $UNKNOWN;
+   }
+   #
+   #
+   # If the user supplied -v or --verbose switch, increase script output verbosity for debugging
+   if( defined( $opt_v ) ) {
+      $verbose = "yes";
+   }
+   #
+   #
+   # Check to see if the user provided the --tsmuser=SomeUser parameter
+   #
+   if( defined( $opt_u ) ) {
+      $tsmuser = $opt_u;
+   }
+   #
+   # Check to see if the user provided the --tsmpass=SomePass parameter
+   #
+   if( defined( $opt_p ) ) {
+      $tsmpass = $opt_p;
+   }
+   #
+   # Check to see if the user provided the --tsmserver=SomeServer parameter
+   #
+   if( defined( $opt_p ) ) {
+      $tsmserver = $opt_p;
+   }
+   #
+   # Check to see if the user provided the --library_name=SomeLibrary parameter
+   #
+   if( defined( $opt_l ) ) {
+      $library_name = $opt_l;
+   }
+}                       #end of subroutine
+
+
+
+sub sanity_checks {
+   #
+   # confirm dsmadmc binary exists
+   # 
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   # 
+   if ( ! -e $dsmadmc ) {
+      print "$CHECK_NAME CRITICAL - Cannot find $dsmadmc binary.\n";
+      exit( $CRITICAL );
+   }
+   if ( ! -x $dsmadmc ) {
+      print "$CHECK_NAME CRITICAL - $dsmadmc binary is not executable by the current user.\n";
+      exit( $CRITICAL );
+   }
+   #
+   $ps = "/bin/ps"     if ( -e "/bin/ps");     		#location on Linux
+   $ps = "/usr/bin/ps" if ( -e "/usr/bin/ps");   	#location on Linux
+   if ( ! -e $ps ) {
+      print "$CHECK_NAME CRITICAL - Cannot find $ps binary.\n";
+      exit( $CRITICAL );
+   }
+   if ( ! -x $ps ) {
+      print "$CHECK_NAME CRITICAL - $ps binary is not executable by the current user.\n";
+      exit( $CRITICAL );
+   }
+   #
+   # Confirm the --tsmuser= --tsmpass= --tsmserver= --library_name= parameterse were provided, or hardcoded equivalents were used
+   # This section uses the -z test to see if the scalar variables are nonzero length
+   if ( -z "$tsmuser" ) {
+      print "$CHECK_NAME CRITICAL - Please provide the --tsmuser=XXX parameter \n";
+      exit( $CRITICAL );
+   }
+   if ( -z "$tsmpass" ) {
+      print "$CHECK_NAME CRITICAL - Please provide the --tsmpass=XXX parameter \n";
+      exit( $CRITICAL );
+   }
+   if ( -z "$tsmserver" ) {
+      print "$CHECK_NAME CRITICAL - Please provide the --tsmserver=XXX parameter \n";
+      exit( $CRITICAL );
+   }
+   if ( -z "$library_name" ) {
+      print "$CHECK_NAME CRITICAL - Please provide the --library_name=XXX parameter \n";
+      exit( $CRITICAL );
+   }
+}									#end of subroutine
+
+
+
+sub check_for_output_file {
+   #
+   # a cron job may have already created the output file that we need
+   #
+   print "running check_for_output_file subroutine \n" if ($verbose eq "yes");
+   #
+   $outputfile = "/tmp/nagios.check_tsm.$tsmserver";                            #name of temporary file
+   print"   checking for existence of temporary file $outputfile \n" if ($verbose eq "yes");
+   #
+   # delete the output file if it is more than 14 minutes old
+   if ( -e "$outputfile" ) {                                                    #see if a cron job has already provided the info we need
+      $epoch = time();                                                          #number of seconds since the epoch
+      ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($outputfile);
+      if ( ($epoch - $mtime) > (60 * 14) ) {                                     #mtime is last file modification time in seconds since the epoch
+         if ( "$ENV{LOGNAME}" eq "nagios" ) {            #delete file if it is too old to be of any use (only if script is run by nagios userid)
+            print "   deleting obsolete file $outputfile \n" if ($verbose eq "yes");
+            unlink "$outputfile";
+            # confirm the file was deleted
+            if ( -e "$outputfile" ) {
+               print "ERROR - Could not delete temporary file $outputfile - please check file permissions \n";
+               exit;
+            }                                                                   #end of if block
+         }                                                                      #end of if block
+      }                                                                         #end of if block
+   }                                                                            #end of if block
+   #
+   # Set the file permissions to -rw-rw-rw-
+   # This allows the script to be executed either via cron by the nagios user, or through the nagios poller which runs as the nagios user
+   if ( (-e "$outputfile") && ( -w "$outputfile") ) {
+      chmod 0666,$outputfile;
+   }                                                                            #end of if block
+   #
+   # Confirm the outputfile is writeable so the current user can delete it
+   if ( (-e "$outputfile") && (! -w "$outputfile") ) {
+      print "ERROR - file $outputfile is readonly - please check file permissions.  File should be owned by the nagios userid. \n";
+      exit;
+   }                                                                            #end of if block
+   #
+   # Confirm the outputfile is nonzero size
+   if ( -z "$outputfile" ) {                                                    #see if a cron job has already provided the info we need
+      unlink "$outputfile";                                                     #try to delete the file
+      print "ERROR - file $outputfile is zero size - please check file permissions.  File should be owned by the nagios userid. \n";
+      exit;
+   }                                                                            #end of if block
+   #
+   if ( -e "$outputfile" ) {                                                    #see if a cron job has already provided the info we need
+      print "   found existing file $outputfile - using that for check output \n" if ($verbose eq "yes");
+      open (OUT,"$outputfile") or die "Cannot open $outputfile for reading $! \n";
+      while (<OUT>) {                                                           #read a line from the text file
+         $output_message = $_  if ( $_ =~ /[a-zA-Z]/);                          #get the content of the output file into a variable
+      }                                                                         #end of while loop
+      close OUT;                                                                #close filehandle
+      if ( $output_message !~ /log util/ ) {                                        #confirm output contains data similar to: log util
+         unlink "$outputfile";                                                  #try to delete the file
+         print "ERROR - $outputfile does not contain valid data - please check file permissions.  File should be owned by the nagios userid. \n";
+         exit;                                                                  #exit script
+      }
+      # print the contents of the temporary file then exit the script
+      print $output_message;                                                    #print the content of the output file
+      exit $OK       if ( $output_message =~ /$CHECK_NAME OK/);			#exit with appropriate nagios return code
+      exit $WARN     if ( $output_message =~ /$CHECK_NAME WARN/);		#exit with appropriate nagios return code
+      exit $CRITICAL if ( $output_message =~ /$CHECK_NAME CRITICAL/);		#exit with appropriate nagios return code
+      exit $UNKNOWN  if ( $output_message =~ /$CHECK_NAME UNKNOWN/);		#exit with appropriate nagios return code
+   }                                                                            #end of if block
+}
+
+
+
+sub check_for_multiple_instances {
+   #
+   print "Running check_for_multiple_instances subroutine \n" if ($verbose eq "yes");
+   #
+   # If the log file is huge for some reason (ie giant expiration just took place),
+   # it can take a very long time to read through the TSM activity log, which
+   # causes this check to time out, and also puts extra load on the TSM server
+   # when multiple instances of this script are running simultaneously.
+   #
+   # Ensure only a single instance of this script is running
+   #
+   $instances = 0;                                      #initialize counter variable
+   $cmd = "$ps -ef";
+   print"   running command: $cmd \n" if ($verbose eq "yes");
+   open ( IN, "$cmd |" );                            #open filehandle using command output
+   while (<IN>) {                                       #read a line from filehandle
+      if ( /$0/ ) {                                     #increment counter variable
+         $instances++;
+         print "   Found $instances copies of $0 script running \n" if ($verbose eq "yes");
+      }
+   }                                                    #end of while loop
+   close IN;                                            #close filehandle
+    #
+   if ( $instances > 1 ) {
+      print "$CHECK_NAME WARN: $instances copies of this script are running - exiting \n";
+      exit $WARN;
+   }
+}                                               #end of subroutine
+
+
+
+
+sub get_server_version {
+   #
+   # get the server code version to tell 5 from 6
+   # We need to do this because TSM 6 moved to DB2 database, and some of the commands are different.
+   # You will get output similar to one of the following:
+   #   Storage Management Server for AIX-RS/6000 - Version 5, Release 5, Level 0.0
+   #   Storage Management Server for AIX - Version 6, Release 2, Level 2.0
+   #
+   print "running get_server_version subroutine \n" if ($verbose eq "yes");
+   #
+   $cmd = "$dsmadmc  -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null -dataonly=yes -displaymode=table \"q status\" "; 
+   print"   running command: $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd |");
+   while (<IN>) {
+      if ( /ANS1017E|ANS8023E|ANS1217E/ ) {
+         print "$CHECK_NAME UNKNOWN - Cannot talk to TSM server $tsmserver : $!  \n";
+         exit $UNKNOWN;                                                	 	#exit script
+      }                                                             	    	#end of if block
+      if ( /Storage Management Server.*Version ([0-9]+), Release ([0-9]+), Level ([0-9\.]+)/ ) {
+         $tsm_version = $1;
+         print "   TSM Server version is $tsm_version \n" if ($verbose eq "yes");
+      }										#end of if block
+      if ( /Spectrum Protect Server.*Version ([0-9]+), Release ([0-9]+), Level ([0-9\.]+)/ ) {
+         $tsm_version = $1;
+         print "   TSM Server version is $tsm_version \n" if ($verbose eq "yes");
+      }										#end of if block
+   }										#end of while loop
+   close IN;									#close filehandle
+   #
+   # send an alert if necesary
+   #
+   unless ( $tsm_version ) {
+      print "$CHECK_NAME CRITICAL - Could not determine version of TSM server.\n";
+      exit( $CRITICAL );
+   }
+   #
+   # send an alert if the TSM version is not supported by this script
+   unless ( ($tsm_version == 5) || ($tsm_version == 6) || ($tsm_version == 7) || ($tsm_version == 8) ) {
+      print "$CHECK_NAME CRITICAL - This script is only tested on TSM version 5.x, 6.x, 7.x, 8.x.  You will need to update this script to add support for TSM $tsm_version \n";
+      exit( $CRITICAL );
+   }
+}										#end of subroutine
+
+
+
+
+
+
+
+sub check_tsm_log_util {
+   #
+   # check the utilization of the TSM log
+   #
+   print "running check_tsm_log_util subroutine \n" if ($verbose eq "yes");
+   #
+   if ( $tsm_version == 5 ) {						#Run this section for TSM Server version 5.x
+      $cmd = "$dsmadmc -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null -dataonly=yes -displaymode=table \"SELECT PCT_UTILIZED, MAX_PCT_UTILIZED FROM LOG\" ";
+      print"   running command: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");
+      while (<IN>) {        
+         if ( /ANS1017E|ANS8023E|ANS1217E/ ) { 
+            print "$CHECK_NAME UNKNOWN - Cannot talk to TSM server $tsmserver : $!  \n";
+            exit $UNKNOWN;							#exit script
+         }									#end of if block
+         if ( / +([0-9\.]+) +([0-9\.]+)/ ) {					#look for two decimal numbers (%util and %maxutil)
+            $tsmlog_util    = $1;						#assign more mnemonic variable name
+            $tsmlog_maxutil = $2;						#assign more mnemonic variable name
+            print "   tsmlog_util=$tsmlog_util \n" if ($verbose eq "yes");
+         }									#end of if block
+      }										#end of while loop
+      close IN;									#close filehandle
+   }										#end of if block
+   #
+   #
+   if ( ($tsm_version == 6) || ($tsm_version == 7) || ($tsm_version == 8) ) {							#Run this section for TSM Server version 6.x or greater
+      $cmd = "$dsmadmc -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null -dataonly=yes -displaymode=table \"SELECT USED_SPACE_MB, TOTAL_SPACE_MB FROM LOG\" ";
+      print"   running command: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");
+      while (<IN>) {        
+         if ( /ANS1017E|ANS8023E|ANS1217E/ ) { 
+            print "$CHECK_NAME UNKNOWN - Cannot talk to TSM server $tsmserver : $!  \n";
+            exit $UNKNOWN;							#exit script
+         }									#end of if block
+         if ( / +([0-9\.]+) +([0-9\.]+)/ ) {					#look for two decimal numbers (%util and %maxutil)
+            $tsmlog_util    = $1 / $2 * 100 ;					#used_space_mb / total_space_mb * 100 = %util
+            $tsmlog_util    = sprintf( "%.1f", $tsmlog_util );			#truncate to 1 decimal place
+
+            print "   tsmlog_util=$tsmlog_util \n" if ($verbose eq "yes");
+         }									#end of if block
+      }										#end of while loop
+      close IN;									#close filehandle
+   }										#end of if block
+   #
+   #
+   # Send an alert if necessary
+   #
+   unless ( $tsmlog_util ) {							#run this section if we could not figure out the value of $tsmlog_util
+      print "$CHECK_NAME UNKNOWN - Could not determine TSM log util  \n";
+      exit $UNKNOWN;								#exit script
+   }										#end of unless block
+}										#end of subroutine
+
+
+
+
+
+
+
+sub check_tsm_db_util {
+   #
+   # check the utilization of the TSM database
+   #
+   print "running check_tsm_db_util subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   if ( $tsm_version == 5 ) {							#Run this section for TSM Server version 5.x
+      $cmd = "$dsmadmc -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null -dataonly=yes -displaymode=table \"SELECT PCT_UTILIZED, MAX_PCT_UTILIZED FROM DB\" ";
+      print"   running command: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");
+      while (<IN>) {        							#read a line from the filehandle
+         if ( /ANS1017E|ANS8023E|ANS1217E/ ) { 
+            print "$CHECK_NAME UNKNOWN - Cannot talk to TSM server $tsmserver : $!  \n";
+            exit $UNKNOWN;							#exit script
+         }									#end of if block
+         if ( / +([0-9\.]+) +([0-9\.]+)/ ) {					#look for two decimal numbers (%util and %maxutil)
+            $tsmdb_util    = $1;						#assign more mnemonic variable name
+            $tsmdb_maxutil = $2;						#assign more mnemonic variable name
+            print "   tsmdb_util=$tsmdb_util  tsmlog_crit=$tsmlog_crit \n" if ($verbose eq "yes");
+         }									#end of if block
+      }										#end of while loop
+      close IN;									#close filehandle
+   }
+   #
+   #
+   if ( ($tsm_version == 6) || ($tsm_version == 7)  || ($tsm_version == 8) ) {							#Run this section for TSM Server version 6.x or greater
+      $cmd = "$dsmadmc -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null -dataonly=yes -displaymode=table \"SELECT USED_DB_SPACE_MB, TOT_FILE_SYSTEM_MB FROM DB\"  ";
+      print"   running command: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");
+      while (<IN>) {        							#read a line from the filehandle
+         if ( /ANS1017E|ANS8023E|ANS1217E/ ) { 
+            print "$CHECK_NAME UNKNOWN - Cannot talk to TSM server $tsmserver : $!  \n";
+            exit $UNKNOWN;							#exit script
+         }									#end of if block
+         if ( / +([0-9\.]+) +([0-9\.]+)/ ) {					#look for two decimal numbers (used_db_space_mb and tot_file_system_mb)
+            $tsmdb_util    = $1 / $2 * 100 ;					# used_db_space_mb / tot_file_system_mb * 100 = %util
+            $tsmdb_util    = sprintf( "%.1f", $tsmdb_util );                  #truncate to 1 decimal place
+            print "   tsmdb_util=$tsmdb_util \n" if ($verbose eq "yes");
+         }									#end of if block
+      }										#end of while loop
+      close IN;									#close filehandle
+   }										#end of if block
+   #
+   # Send an alert if necessary
+   #
+   unless ( $tsmdb_util ) {							#run this section if we could not figure out the value of $tsmdb_util
+      print "$CHECK_NAME CRITICAL - Could not determine TSM database util  \n";
+      exit $CRITICAL;								#exit script
+   }										#end of unless block
+}										#end of subroutine
+
+
+
+
+sub check_tsm_db_buffer_pool_hit_ratio {
+   #
+   # Buffer pool hit ratio is a measure of how often a page access (a getpage) is satisfied without requiring an I/O operation.
+   # Buffer Pool Hit Ratio is the ratio of physical reads to logical reads gives the hit ratio for thebuffer pool. 
+   # The lower the hit ratio, the more the data is being read from (slower) disk rather than the (faster) cached buffer pool.
+   # The buffer pool hit ratio should be above 98%.  Below 98% is considered a potential performance problem (insufficient RAM, or buffer pool too small)
+   #
+   print "running check_tsm_db_buffer_pool_hit_ratio subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   if ( ($tsm_version == 5) || ($tsm_version == 6) || ($tsm_version == 7)  || ($tsm_version == 8) ) {		#Run this section for TSM Server version 5.x - 8.x
+      $cmd = "$dsmadmc -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null -dataonly=yes -displaymode=table \"SELECT BUFF_HIT_RATIO FROM DB\" ";
+      print"   running command: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");
+      while (<IN>) {        							#read a line from the filehandle
+         if ( /ANS1017E|ANS8023E|ANS1217E/ ) { 
+            print "$CHECK_NAME UNKNOWN - Cannot talk to TSM server $tsmserver : $!  \n";
+            exit $UNKNOWN;							#exit script
+         }									#end of if block
+         if ( / +([0-9\.]+)/ ) {						#look for a decimal number (buf_hit_ratio)
+            $tsm_db_buffer_pool_hit_ratio = $1;					#save in a variable
+            print "   tsm_db_buffer_pool_hit_ratio=$tsm_db_buffer_pool_hit_ratio \n" if ($verbose eq "yes");
+         }									#end of if block
+      }										#end of while loop
+      close IN;									#close filehandle
+   }										#end of if block
+   #
+   # Send an alert if necessary
+   #
+   unless ( $tsm_db_buffer_pool_hit_ratio ) {					#run this section if we could not figure out the value 
+      print "$CHECK_NAME UNKNOWN - Could not determine TSM database buffer pool hit ratio  \n";
+      exit $UNKNOWN;								#exit script
+   }										#end of unless block
+}										#end of subroutine
+
+
+
+
+sub check_tsm_drives {
+   #
+   # confirm TSM drives are online
+   #
+   print "running check_tsm_drives subroutine \n" if ($verbose eq "yes");
+   $cmd = "$dsmadmc -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null -dataonly=yes -displaymode=table \"SELECT count(*) from DRIVES where ONLINE='YES'\" ";
+   print"   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");
+   while (<IN>) {
+      if ( /ANS1017E|ANS8023E|ANS1217E/ ) {
+         print "$CHECK_NAME UNKNOWN - Cannot talk to TSM server $tsmserver : $!  \n";
+         exit $UNKNOWN;                                                 #exit script
+      }                                                                 #end of if block
+      if ( / +([0-9]+)/ ) {                               		#look for integer
+         $tsm_drives_online = $1;                                       #assign more mnemonic variable name
+      }                                                                 #end of if block
+   }                                                                    #end of while loop
+   close IN;                                                            #close filehandle
+   #
+   $cmd = "$dsmadmc -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null -dataonly=yes -displaymode=table \"SELECT count(*) from DRIVES where ONLINE='NO'\" ";
+   print"   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");
+   while (<IN>) {
+      if ( /ANS1017E|ANS8023E|ANS1217E/ ) {
+         print "$CHECK_NAME UNKNOWN - Cannot talk to TSM server $tsmserver : $!  \n";
+         exit $UNKNOWN;                                                 #exit script
+      }                                                                 #end of if block
+      if ( / +([0-9]+)/ ) {                               		#look for integer
+         $tsm_drives_offline = $1;      				#assign more mnemonic variable name
+      }                                                                 #end of if block
+   }                                                                    #end of while loop
+   close IN;                                                            #close filehandle
+   print "   drives_online:$tsm_drives_online drives_offline:$tsm_drives_offline \n" if ($verbose eq "yes");
+}                            
+
+
+
+
+
+sub check_tsm_paths {
+   #
+   # confirm TSM paths are online
+   #
+   print "running check_tsm_paths subroutine \n" if ($verbose eq "yes");
+   print"   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$dsmadmc -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null -dataonly=yes -displaymode=table \"SELECT count(*) from PATHS where ONLINE='YES'\" |");
+   while (<IN>) {
+      if ( /ANS1017E|ANS8023E|ANS1217E/ ) {
+         print "$CHECK_NAME UNKNOWN - Cannot talk to TSM server $tsmserver : $!  \n";
+         exit $UNKNOWN;                                                 #exit script
+      }                                                                 #end of if block
+      if ( / +([0-9]+)/ ) {                               		#look for integer
+         $tsm_paths_online = $1;                                       #assign more mnemonic variable name
+      }                                                                 #end of if block
+   }                                                                    #end of while loop
+   close IN;                                                            #close filehandle
+   print"   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$dsmadmc -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null -dataonly=yes -displaymode=table \"SELECT count(*) from PATHS where ONLINE='NO'\" |");
+   while (<IN>) {
+      if ( /ANS1017E|ANS8023E|ANS1217E/ ) {
+         print "$CHECK_NAME UNKNOWN - Cannot talk to TSM server $tsmserver : $!  \n";
+         exit $UNKNOWN;                                                 #exit script
+      }                                                                 #end of if block
+      if ( / +([0-9]+)/ ) {                               		#look for integer
+         $tsm_paths_offline = $1;                                       #assign more mnemonic variable name
+      }                                                                 #end of if block
+   }                                                                    #end of while loop
+   close IN;                                                            #close filehandle
+   print "   paths_online:$tsm_paths_online paths_offline:$tsm_paths_offline \n" if ($verbose eq "yes");
+}                            
+
+
+
+
+
+
+sub check_tsm_scratch_tapes {
+   #
+   # check the number of available scratch tapes
+   #
+   print "running check_tsm_scratch_tapes subroutine \n" if ($verbose eq "yes");
+   $cmd = "$dsmadmc -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null -dataonly=yes -displaymode=table \"SELECT count(*) FROM libvolumes WHERE STATUS='Scratch'\" 2>&1";
+   print"   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");
+   while (<IN>) {
+      if ( /ANS1017E|ANS8023E|ANS1217E/ ) {
+         print "$CHECK_NAME UNKNOWN - Cannot talk to TSM server $tsmserver : $!  \n";
+         exit $UNKNOWN;                                                 #exit script
+      }                                                                 #end of if block
+      if ( / +([0-9]+)/ ) {     		        		#look for integer
+         $tsm_scratchtapes  = $1;                            		#assign more mnemonic variable name
+      }                                                                 #end of if block
+   }                                                                    #end of while loop
+   close IN;                                                            #close filehandle
+   print "   scratch_tapes:$tsm_scratchtapes \n" if ($verbose eq "yes");
+}            								#end of subroutine
+
+
+
+
+
+sub check_tape_library_free_slots {
+   #
+   # Check to see how many free slots are in the tape library.
+   #
+   # NOTE: The "show slots" command requires the "SYstem" privilege on the TSM server.
+   #       # dsmadmc
+   #       tsm: > grant authority username CLasses=SYstem
+   #
+   # NOTE: The "show slots" command does not show EMPTY slots.  You need to subtract the used slots from the total slots to get empty slots.
+   #
+   print "running check_tape_library_free_slots subroutine \n" if ($verbose eq "yes");
+   $cmd = "$dsmadmc -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null show slots $library_name 2>&1 ";
+   print"   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");
+   while (<IN>) {
+      if ( /ANS1017E|ANS8023E|ANS1217E/ ) {
+         print "$CHECK_NAME UNKNOWN - Cannot talk to TSM server $tsmserver : $!  \n";
+         exit $UNKNOWN;                                                 #exit script
+      }                                                                 #end of if block
+      if ( /^Slots +: +([0-9]+)/ ) {  		        		#look for line that shows total number of slots in library
+         $library_totalslots = $1;                            		#assign more mnemonic variable name
+         print "   found $library_totalslots total slots in library \n" if ($verbose eq "yes");
+      }                                                                 #end of if block
+      if ( /^Slot [0-9]+, status/ ) {  		        		#look for line that shows total number of slots in library
+         $library_usedslots++;                            		#increment counter
+      }                                                                 #end of if block
+   }                                                                    #end of while loop
+   close IN;                                                            #close filehandle
+   #
+   # Figure out how many slots are free
+   $library_freeslots = $library_totalslots - $library_usedslots;
+   print "   found $library_usedslots used slots in library \n" if ($verbose eq "yes");
+   print "   found $library_freeslots free slots in library \n" if ($verbose eq "yes");
+}            								#end of subroutine
+
+
+
+
+
+
+sub check_tape_library_cleaning_tapes {
+   #
+   print "running check_tape_library_cleaning_tapes subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   $cmd = "$dsmadmc -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null show slots $library_name 2>&1 ";
+   print"   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");
+   while (<IN>) {
+      if ( /^Slot [0-9]+, status Cleaner/ ) {  	        		#look for line that shows total number of slots in library
+         $library_cleaningslots = 0 if ( $library_cleaningslots =~ /unknown/ );	#initialize counter to zero the first time we find a cleaning slot
+         $library_cleaningslots++;                            		#increment counter
+         print "   found cleaning tape \n" if ($verbose eq "yes");
+      }                                                                 #end of if block
+   }                                                                    #end of while loop
+   close IN;                                                            #close filehandle
+   #
+   # confirm that we actually found some cleaning tapes
+   if ( $library_cleaningslots =~ /unknown/ ) {
+      print "$CHECK_NAME WARN - Could not determine the number of cleaning tapes in the library.  Please revew the output of the dsmadmc show slots command. \n";
+      exit $WARN;                                                   	#exit script
+   }                                                                    #end of if block
+   #
+   # warn if we are low on cleaning tapes
+   if ( $library_cleaningslots < $library_cleaningslots_warn ) {
+      print "$CHECK_NAME WARN - There are only $library_cleaningslots cleaning tapes in the library.  Please add more cleaning tapes.  \n";
+      exit $WARN;                                                   	#exit script
+   }                                                                    #end of if block
+   #
+   $cmd = "$dsmadmc -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null -dataonly=yes -displaymode=table \"SELECT CLEANINGS_LEFT FROM libvolumes WHERE STATUS='Cleaner'\" ";
+   print"   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");
+   while (<IN>) {
+      print "   cleanings left on tape: $_ " if ($verbose eq "yes");
+      if ( /ANS1017E|ANS8023E|ANS1217E/ ) {
+         print "$CHECK_NAME UNKNOWN - Cannot talk to TSM server $tsmserver : $!  \n";
+         exit $UNKNOWN;                                                 #exit script
+      }                                                                 #end of if block
+      if ( / +([0-9]+)/ ) {                              		#look for number of cleanings left on each cleaning tape
+         $tsm_cleaningtapes++;						#increment counter to get number of cleaning tapes
+         $cleanings_left = $cleanings_left + $1;                   	#add up how many cleanings cycles are left on each cleaning tape
+      }                                                                 #end of if block
+   }                                                                    #end of while loop
+   close IN;                                                            #close filehandle
+   #
+   # Send an alert if there are only a few cleaning cycles left on all the cleaning tapes
+   #
+   if ( $cleanings_left <= $cleanings_left_crit ) {
+      print "$CHECK_NAME CRITICAL - There are $tsm_cleaningtapes cleaning tapes left in the tape library, and a total of $cleanings_left cleaning cycles remain on these tapes.  Please order more cleaning tapes. \n";
+      exit $CRITICAL;                                                   #exit script
+   }                                                                    #end of if block
+   if ( $cleanings_left <= $cleanings_left_warn ) {
+      print "$CHECK_NAME WARN - There are $tsm_cleaningtapes cleaning tapes left in the tape library, and a total of $cleanings_left cleaning cycles remain on these tapes.  Please order more cleaning tapes. \n";
+      exit $WARN;                                                   #exit script
+   }                                                                    #end of if block
+}            								#end of subroutine
+
+
+
+
+
+
+sub check_tsm_actlog_entries {
+   #
+   # There are several things we need to check the TSM activity log for
+   # Note that this section can take a while, as the TSM server has to query the activity log
+   # We only look at the last 12 hours of the activity log, as that should be plenty of time to detect and send an alert.
+   #
+   print "running check_tsm_actlog_entries \n" if ($verbose eq "yes");
+   #
+   # Run a command to dump the TSM activity log to a temporary file.
+   # We do this do avoid the "Press ENTER to continue" at each page of text in the activity log output 
+   my $x = `$dsmadmc -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null -outfile=$tsm_actlog_dirty query actlog begint=now-12:00`;
+   #
+   # Now that we have the temporary file containing the TSM activity log, munge it so each log entry is on a single line, 
+   # instead of the annoying TSM feature of breaking to a new line every 80 characters.  
+   # 
+   print"   opening $tsm_actlog_dirty file for reading \n" if ($verbose eq "yes");
+   print"   opening $tsm_actlog_clean file for writing \n" if ($verbose eq "yes");
+   open(IN,"$tsm_actlog_dirty")   or die "Cannot open $tsm_actlog_dirty for reading $! \n";	#open the actlog for reading (will need cleaning up)
+   open(OUT,">$tsm_actlog_clean") or die "Cannot open $tsm_actlog_clean for writing $! \n";	#open another file to write the cleaned up actlog to
+   while (<IN>) {                               						#read a line from the text file
+      chomp;                                    						#remove the newline from every line
+      print OUT "\n" if ( /^[0-9]/ );           						#print a newline at the beginning of each line that starts with a datestamp
+      s/  +/ /g;                            				    			#replace multiple spaces with a single space
+      print OUT $_;                             						#print the line of text (without any newline characters
+   }                                   	         						#end of while loop
+   close IN;                           	         						#close filehandle
+   close OUT;											#close filehandle
+   unlink $tsm_actlog_dirty if ( -f "$tsm_actlog_dirty");   					#delete temporary file
+   #
+   # Now we have a cleaned up copy of the TSM activity log in $tsm_actlog.clean
+   # Open that file hand look for assorted problems
+   #
+   print"   opening $tsm_actlog_clean file for reading \n" if ($verbose eq "yes");
+   open(IN,"$tsm_actlog_clean") or die "Cannot open $tsm_actlog_clean for reading $! \n";	#open the actlog for reading
+   while (<IN>) {                               #read a line from the text file
+      #
+      # look for Media errors on tape
+      if ( /Media fault detected/ ) {   	        					#look for entry in TSM actlog 
+         chomp $_;										#remove newline
+         # add the message to a scalar variable that will be used to send alerts later
+         $tsm_actlog_messages = "$tsm_actlog_messages $CHECK_NAME WARN Media fault dectected.  This may be due to a bad tape or bad tape drive.  Review the TSM actlog to see if you can find a tape with errors, then move the data off that tape.  The actlog entry is:  $_  "
+      }                                                                 			#end of if block
+      #
+      # look for Hardware errors on the tape or tape drive
+      if ( /Hardware or media error/ ) {   	   				     		#look for entry in TSM actlog 
+         chomp $_;										#remove newline
+         # add the message to a scalar variable that will be used to send alerts later
+         $tsm_actlog_messages = "$tsm_actlog_messages  $CHECK_NAME WARN - found Hardware or media error.  This may be due to a bad tape or bad tape drive.  Review the TSM actlog to see if you can find a tape with errors, then move the data off that tape.  The actlog entry is:  $_ ";
+      }                                                                			 	#end of if block
+      #
+      # look for low disk space in server database directory (usually /home/tsminst1/tsminst1)
+      # The line in the actlog will look similar to the following:
+      # 07/23/12 22:57:07 ANR1546W The available space for the server database  directory ( /home/tsminst1/tsminst1 ) is less than 1GB.  (PROCESS: 992) 
+      if ( /The available space for the server database +directory .* is less than 1GB/ ) {  	#look for entry in TSM actlog 
+         chomp $_;										#remove newline
+         # add the message to a scalar variable that will be used to send alerts later
+         $tsm_actlog_messages = "$tsm_actlog_messages  $CHECK_NAME WARN - TSM low disk space warning for server database directory.  Review the following entry in the TSM actlog:  $_ ";
+      }                                                                			 	#end of if block
+      #
+      # look for low disk space in the diagpath file system (usually /home/tsminst1/sqllib/db2dump)
+      # The line in the actlog will look similar to the following:
+      # 07/23/12 22:57:07 ANR1545W The diagpath ( /home/tsminst1/sqllib/db2dump )  file system or disk is becoming full. Total space used:  3,096 MB. Total space available: 3,584 MB. Percent full: 86.38 percent. (PROCESS: 992) 
+      if ( /The diagpath .* filesystem or disk is becoming full/ ) {   		     		#look for entry in TSM actlog 
+         chomp $_;										#remove newline
+         # add the message to a scalar variable that will be used to send alerts later
+         $tsm_actlog_messages = "$tsm_actlog_messages  $CHECK_NAME WARN - TSM diagpath low disk space warning.  Please review the following TSM actlog entry:  $_ ";
+      }                                                                			 	#end of if block
+      #
+      # look for reclamation errors
+      # The line in the actlog will look similar to the following:
+      # 09/13/12 16:00:29 ANR1463E RUN: Command script RECLAIM completed in error.  (SESSION: 2216652)
+      if ( /RUN: Command script RECLAIM.* completed in error/ ) {   		     		#look for entry in TSM actlog 
+         chomp $_;										#remove newline
+         # add the message to a scalar variable that will be used to send alerts later
+         $tsm_actlog_messages = "$tsm_actlog_messages  $CHECK_NAME WARN - TSM reclamation script error.  Please review the following TSM actlog entry:  $_ ";
+      }                                                                			 	#end of if block
+      #
+      # look for generic TSM script errors errors
+      # The line in the actlog will look similar to the following:
+      # 09/13/12 16:00:29 ANR1463E RUN: Command script <script name goes here> completed in error.  (SESSION: 2216652)
+      if ( /RUN: Command script .* completed in error/ ) {   		     		#look for entry in TSM actlog 
+         chomp $_;										#remove newline
+         # add the message to a scalar variable that will be used to send alerts later
+         $tsm_actlog_messages = "$tsm_actlog_messages $CHECK_NAME WARN - TSM administrative script error.  Please review the following TSM actlog entry:  $_ ";
+      }                                                                			 	#end of if block
+      #
+      # look for Critical TapeAlert messages
+      # The line in the actlog will look similar to the following:
+      # 09/14/12 14:43:30 ANR8948S Device /dev/rmt2, volume has issued the  following Critical TapeAlert: Your data is at risk: 
+      # 1.  Copy any data you require from this tape. 2. Do not use  this tape again. 
+      # 3. Restart the operation with a  different tape. (SESSION: 2233938, PROCESS: 3938)
+      if ( /Critical TapeAlert/ ) {   		     		#look for entry in TSM actlog 
+         chomp $_;										#remove newline
+         # add the message to a scalar variable that will be used to send alerts later
+         $tsm_actlog_messages = "$tsm_actlog_messages  $CHECK_NAME WARN - TSM Critical TapeAlert.  Please review the following TSM actlog entry:  $_ ";
+      }                                                                			 	#end of if block
+      #
+      # look for errors related to moving tapes from one slot to another in the tape library
+      # The line in the actlog will look similar to the following:
+      # 10/24/13   08:05:17   ANR8942E Could not move volume NL5217L4 from slot-element 259 to slot-element 1248. (SESSION: 85207)
+      if ( /Could not move volume .* from slot/ ) {   		     		#look for entry in TSM actlog 
+         chomp $_;										#remove newline
+         # add the message to a scalar variable that will be used to send alerts later
+         $tsm_actlog_messages = "$tsm_actlog_messages  $CHECK_NAME WARN - TSM tape movement error.  Please review the following TSM actlog entry:  $_ ";
+      }                                                                			 	#end of if block
+      #
+      # look for errors related to mounting tapes
+      # The line in the actlog will look similar to the following:
+      # 10/24/13   08:05:17   ANR8381E LTO volume NL5217L4 could not be mounted in drive DRIVE3 (/dev/rmt2). (SESSION: 85207)
+      if ( /volume .* could not be mounted in drive/ ) {   		     		#look for entry in TSM actlog 
+         chomp $_;										#remove newline
+         # add the message to a scalar variable that will be used to send alerts later
+         $tsm_actlog_messages = "$tsm_actlog_messages  $CHECK_NAME WARN - TSM tape mount error.  Please review the following TSM actlog entry:  $_ ";
+      }                                                                			 	#end of if block
+   }                                                                    			#end of while loop
+   close IN;                                                            			#close filehandle
+   unlink $tsm_actlog_clean if ( -f "$tsm_actlog_clean"); 					#delete temporary file
+}            											#end of subroutine
+
+
+
+
+
+sub check_tsm_readonly_tapes {
+   #
+   # check the number of available scratch tapes
+   #
+   print "running check_tsm_readonly_tapes subroutine \n" if ($verbose eq "yes");
+   $cmd = "$dsmadmc -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null -dataonly=yes -displaymode=table \"SELECT count(*) FROM volumes WHERE ACCESS='READONLY' AND (STGPOOL_NAME='COPYPOOL' or STGPOOL_NAME='COPY_LTO_DBPOOL' or STGPOOL_NAME='LTO_ARCHIVEPOOL' or STGPOOL_NAME='LTO_DBPOOL' or STGPOOL_NAME='LTO_POOL')\" ";
+   print"   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");
+   while (<IN>) {
+      if ( /ANS1017E|ANS8023E|ANS1217E/ ) {
+         print "$CHECK_NAME UNKNOWN - Cannot talk to TSM server $tsmserver : $!  \n";
+         exit $UNKNOWN;                                                 #exit script
+      }                                                                 #end of if block
+      if ( / +([0-9]+)/ ) {     		        		#look for integer
+         $tsm_readonlytapes  = $1;                            		#assign more mnemonic variable name
+      }                                                                 #end of if block
+   }                                                                    #end of while loop
+   close IN;                                                            #close filehandle
+   #
+   # Send an alert if any tapes have gone into readonly mode
+   #
+   if ( $tsm_readonlytapes >= $tsm_readonly_crit ) {
+      print "$CHECK_NAME CRITICAL - There are $tsm_readonlytapes Readonly tapes in the TSM library.  Try to get the data off the bad tape with the movedata command.  If there are multiple readonly tapes, it may be indicative of a dirty tape drive or other environmental problem.  Find the readonly tape with: dsmadmc> SELECT volume_name FROM volumes WHERE ACCESS=\'READONLY\'  \n";
+      exit $CRITICAL;                                                   #exit script
+   }                                                                    #end of if block
+   if ( $tsm_readonlytapes >= $tsm_readonly_warn ) {
+      print "$CHECK_NAME WARN - There are $tsm_readonlytapes Readonly tapes in the TSM library.  Try to get the data off the bad tape with the movedata command.  If there are multiple readonly tapes, it may be indicative of a dirty tape drive or other environmental problem.  Find the readonly tape with: dsmadmc> SELECT volume_name FROM volumes WHERE ACCESS=\'READONLY\'  \n";
+      exit $WARN;                                                   	#exit script
+   }                                                                    #end of if block
+}            
+
+
+
+
+sub check_tsm_unavailable_tapes {
+   #
+   # check the number of available scratch tapes
+   #
+   print "running check_tsm_unavailable_tapes subroutine \n" if ($verbose eq "yes");
+   $cmd = "$dsmadmc -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null -dataonly=yes -displaymode=table \"SELECT count(*) FROM volumes WHERE ACCESS='UNAVAILABLE'\" ";
+   print"   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");
+   while (<IN>) {
+      if ( /ANS1017E|ANS8023E|ANS1217E/ ) {
+         print "$CHECK_NAME UNKNOWN - Cannot talk to TSM server $tsmserver : $!  \n";
+         exit $UNKNOWN;                                                 #exit script
+      }                                                                 #end of if block
+      if ( / +([0-9]+)/ ) {     		        		#look for integer
+         $tsm_unavailabletapes  = $1;                          		#assign more mnemonic variable name
+      }                                                                 #end of if block
+   }                                                                    #end of while loop
+   close IN;                                                            #close filehandle
+}            
+
+
+
+
+sub check_client_schedules {
+   #
+   # check for problems with client schedules
+   # HINT: If you don't care about the Completed schedules, add "exceptions=yes" to the dsmadmc command to only show problems.
+   #
+   print "running check_client_schedules subroutine \n" if ($verbose eq "yes");
+   $cmd = "$dsmadmc -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null -dataonly=yes -displaymode=table \"query event * * type=client begindate=today-1 begintime=now enddate=today endtime=now\" ";
+   print"   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");
+   while (<IN>) {
+      if ( /ANS1017E|ANS8023E|ANS1217E/ ) {
+         print "$CHECK_NAME UNKNOWN - Cannot talk to TSM server $tsmserver : $!  \n";
+         exit $UNKNOWN;                                                 #exit script
+      }                                                                 #end of if block
+      $client_schedule_completed++  if ( /Completed/ );       		#look for status of client schedule
+      $client_schedule_failed++     if ( /Failed/    );       		#look for status of client schedule
+      #
+      # We do something special for the "Missed" TSM client schedules.
+      # The DBA team likes to have the Oracle archive logs backed up every hour.
+      # Unfortunately, if the regular flat file or TDP backup for that TSM node is running for more than 1 hour,
+      # the TSM client schedule to backup the Oracle archive logs will be missed, because you cannot
+      # have two client schedules running backups against the same node at the same time.
+      # Since most of the flat file or TDP backups last more than an hour, it means that every Oracle
+      # server will occasionally miss an ORACLE_ARCHLOG backup.  Since we don't care about missing
+      # an occasional ORACLE_ARCHLOG backup, do not count them as missed backups for alerting purposes.
+      if ( /Missed/ ) {
+         unless ( /ORACLE_ARCH/ ) {
+            $client_schedule_missed++;       				#look for status of client schedule
+         }								#end of unless block
+      }									#end of if block
+   }                                                                    #end of while loop
+   close IN;                                                            #close filehandle
+}            								#end of subroutine
+
+
+
+
+
+sub check_admin_schedules {
+   #
+   # check for problems with administrative schedules  (backup storage pools, tape migrations, offsite copies, etc)
+   # HINT: If you don't care about the Completed schedules, add "exceptions=yes" to the dsmadmc command to only show problems.
+   #
+   print "running check_admin_schedules subroutine \n" if ($verbose eq "yes");
+   $cmd = "$dsmadmc -id=$tsmuser -password=$tsmpass -server=$tsmserver -errorlogname=/dev/null -dataonly=yes -displaymode=table \"query event * type=admin begindate=today-1 begintime=now enddate=today endtime=now\" ";
+   print"   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");
+   while (<IN>) {
+      if ( /ANS1017E|ANS8023E|ANS1217E/ ) {
+         print "$CHECK_NAME UNKNOWN - Cannot talk to TSM server $tsmserver : $!  \n";
+         exit $UNKNOWN;                                                 #exit script
+      }                                                                 #end of if block
+      $admin_schedule_completed++  if ( /Completed/ );       		#look for status of client schedule
+      $admin_schedule_failed++     if ( /Failed/    );       		#look for status of client schedule
+      $admin_schedule_missed++     if ( /Missed/    );       		#look for status of client schedule
+   }                                                                    #end of while loop
+   close IN;                                                            #close filehandle
+}            								#end of subroutine
+
+
+
+
+
+
+sub print_output {
+   #
+   print "running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   # open the temporary file that will be used to store the results for subsequent checks 
+   print "   opening output file $outputfile for writing \n" if ($verbose eq "yes");
+   open(OUT,">$outputfile") or warn "Cannot open $outputfile for writing $! \n";
+   #
+   #
+   # Much of the text of the output will be the same.  Put the common stuff in a variable so we can simplify the outputs
+   #
+   $common_output_data = "TSM log util:${tsmlog_util}% / TSM db util:${tsmdb_util}% / TSM db buffer pool hit ratio:${tsm_db_buffer_pool_hit_ratio}% / drives online:${tsm_drives_online} / paths online:${tsm_paths_online} / scratch tapes:${tsm_scratchtapes} / client schedules completed=${client_schedule_completed} failed=${client_schedule_failed} missed=${client_schedule_missed} / admin schedules completed=${admin_schedule_completed} failed=${admin_schedule_failed}  missed=${admin_schedule_missed} / unavailable tapes:${tsm_unavailabletapes} / readonly tapes:${tsm_readonlytapes} / Total slots in tape library:$library_totalslots Used:$library_usedslots Free:$library_freeslots / Cleaning tapes:$library_cleaningslots Cleaning cycles left on tapes:$cleanings_left $tsm_actlog_messages";
+   #
+   #
+   # Send an alert if client backup schedules were missed
+   #
+   if ( $client_schedule_failed >= $client_schedule_failed_crit ) {
+      $output_message = "$CHECK_NAME CRITICAL - There are $client_schedule_failed failed TSM client schedules.  Please check with query event * *  $common_output_data \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $CRITICAL;                                                   	#exit script
+   }                                                                    	#end of if block
+   if ( $client_schedule_failed >= $client_schedule_failed_warn ) {
+      $output_message = "$CHECK_NAME WARN - There are $client_schedule_failed failed TSM client schedules.  Please check with query event * *   $common_output_data \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $WARN;                              					#exit script
+   }                                                                    	#end of if block
+   if ( $client_schedule_missed >= $client_schedule_missed_crit ) {
+      $output_message = "$CHECK_NAME CRITICAL - There are $client_schedule_missed missed TSM client schedules.  Please check with query event * * $common_output_data \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $CRITICAL;                                                  		#exit script
+   }                                                                    	#end of if block
+   if ( $client_schedule_missed >= $client_schedule_missed_warn ) {
+      $output_message = "$CHECK_NAME WARN - There are $client_schedule_missed missed TSM client schedules.  Please check with query event * * $common_output_data \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $WARN;                                                   		#exit script
+   }                                                                    	#end of if block
+   #
+   # Send an alert if admin schedules were missed
+   #
+   if ( $admin_schedule_failed >= $admin_schedule_failed_crit ) {
+      $output_message = "$CHECK_NAME CRITICAL - There are $admin_schedule_failed failed TSM admin schedules.  Please check with query event * type=admin  $common_output_data \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $CRITICAL;                                                   	#exit script
+   }                                                                    	#end of if block
+   if ( $admin_schedule_failed >= $admin_schedule_failed_warn ) {
+      $output_message = "$CHECK_NAME WARN - There are $admin_schedule_failed failed TSM admin schedules.  Please check with query event * type=admin  $common_output_data \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $WARN;                              					#exit script
+   }                                                                    	#end of if block
+   if ( $admin_schedule_missed >= $admin_schedule_missed_crit ) {
+      $output_message = "$CHECK_NAME CRITICAL - There are $admin_schedule_missed missed TSM admin schedules.  Please check with query event * type=admin $common_output_data \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $CRITICAL;                                                  		#exit script
+   }                                                                    	#end of if block
+   if ( $admin_schedule_missed >= $admin_schedule_missed_warn ) {
+      $output_message = "$CHECK_NAME WARN - There are $admin_schedule_missed missed TSM admin schedules.  Please check with query event * type=admin $common_output_data \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $WARN;                                                   		#exit script
+   }                                                                    	#end of if block
+   #
+   # send an alert if the TSM log utilization is too high
+   #
+   if ( $tsmlog_util >= $tsmlog_crit ) {
+      $output_message = "$CHECK_NAME CRITICAL - TSM log util is at ${tsmlog_util}%.  Should be below ${tsmlog_warn}.  $common_output_data  \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $CRITICAL;								#exit script
+   }										#end of if block
+   if ( $tsmlog_util >= $tsmlog_warn ) {
+      $output_message = "$CHECK_NAME WARN - TSM log util is at ${tsmlog_util}%.  Should be below ${tsmlog_warn}.  $common_output_data  \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $WARN;								#exit script
+   }										#end of if block
+   #
+   # send an alert if the TSM database utilization is too high
+   #
+   if ( $tsmdb_util >= $tsmdb_crit ) {
+      $output_message = "$CHECK_NAME CRITICAL - TSM database util is at ${tsmdb_util}%.  Should be below ${tsmdb_warn}.  $common_output_data  \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $CRITICAL;								#exit script
+   }										#end of if block
+   if ( $tsmdb_util >= $tsmdb_warn ) {
+      $output_message = "$CHECK_NAME WARN - TSM database util is at ${tsmdb_util}%.  Should be below ${tsmdb_warn}.  $common_output_data  \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $WARN;								#exit script
+   }										#end of if block
+#   #
+#   # send an alert if the TSM database buffer pool hit ratio is too low
+#   # This usually means RAM is too low
+#   #
+#   if ( $tsm_db_buffer_pool_hit_ratio < 98 ) {
+#      $output_message = "$CHECK_NAME WARN - TSM database buffer pool hit ratio is at ${tsm_db_buffer_pool_hit_ratio}%.  Should be above 98%.  $common_output_data  \n";
+#      print OUT "$output_message"; close OUT;					#print to file
+#      print     "$output_message";						#print to screen
+#      exit $WARN;								#exit script
+#   }										#end of if block
+   #
+   # Send an alert if any of the tape drives are offline
+   #
+   unless ( $tsm_drives_online  ) {						#run this section if we could not detect the number of drives online
+      $output_message = "$CHECK_NAME CRITICAL - Could not determine the number of drives online.  $common_output_data   \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $CRITICAL;                          	                         	#exit script
+   }                                                                    	#end of if block
+   if ( $tsm_drives_offline >= $tsm_drives_crit ) {
+      $output_message = "$CHECK_NAME CRITICAL - There are $tsm_drives_offline TSM drives offline. $common_output_data  \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $CRITICAL;                                                   	#exit script
+   }                                                                    	#end of if block
+   if ( $tsm_drives_offline >= $tsm_drives_warn ) {
+      $output_message = "$CHECK_NAME WARN - There are $tsm_drives_offline TSM drives offline.  $common_output_data \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $WARN;  								#exit script
+   }                                                                    	#end of if block
+   #
+   # Send an alert if any of the TSM paths are offline
+   #
+   unless ( $tsm_paths_online  ) {						#run this section if we could not detect the number of paths online
+      $output_message = "$CHECK_NAME CRITICAL - Could not determine the number of paths online.  $common_output_data  \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $CRITICAL;                                                   	#exit script
+   }                                                                    	#end of if block
+   if ( $tsm_paths_offline >= $tsm_paths_crit ) {
+      $output_message = "$CHECK_NAME CRITICAL - There are $tsm_paths_offline TSM drives offline.  $common_output_data \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $CRITICAL;                                                   	#exit script
+   }                                                                    	#end of if block
+   if ( $tsm_paths_offline >= $tsm_paths_warn ) {
+      $output_message = "$CHECK_NAME WARN - There are $tsm_paths_offline TSM drives offline.  $common_output_data \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $WARN;  								#exit script
+   }                                                                    	#end of if block
+   #
+   # Send an alert if the tape library is out of scratch tapes
+   #
+   unless ( $tsm_scratchtapes ) {						#run this section if we could not detect the number of scratch tapes
+      $output_message = "$CHECK_NAME CRITICAL - Could not determine the number of scratch tapes  \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $CRITICAL;                                          	         	#exit script
+   }                                                                    	#end of if block
+   if ( $tsm_scratchtapes <= $tsm_scratch_crit ) {
+      $output_message = "$CHECK_NAME CRITICAL - There are only $tsm_scratchtapes scratch tapes left in the TSM library.  Should be at least  $tsm_scratch_warn  \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $CRITICAL;                                                   	#exit script
+   }                                                                    	#end of if block
+   if ( $tsm_scratchtapes <= $tsm_scratch_warn ) {
+      $output_message = "$CHECK_NAME WARN - There are only $tsm_scratchtapes scratch tapes left in the TSM library.  Should be at least  $tsm_scratch_warn  \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $WARN;                                                   		#exit script
+   }                                                                    	#end of if block
+   #
+   # Send an alert if the tape library is out of free tape slots
+   #
+   if ( $library_totalslots == 0 ) { 						#if there are zero slots found, it might mean the $library_name variable is wrong
+      $output_message = "$CHECK_NAME WARN - Could not determine number of slots in library.  Confirm the \$library_name=$library_name variable in this script is correct. $common_output_data \n";
+      print OUT "$output_message"; close OUT; 					#print to file
+      print     "$output_message";						#print to screen
+      exit $WARN;                                                   		#exit script
+   }                                                                    	#end of if block
+   #
+   if ( $library_freeslots <= $library_freeslots_warn ) {
+      if ( $tsm_scratchtapes <= $tsm_scratch_warn ) {
+         $output_message = "$CHECK_NAME WARN - There are only $library_freeslots free slots in the tape library.  If you are also short on scratch tapes, the library may need to be expanded. $common_output_data \n";
+         print OUT "$output_message"; close OUT; 				#print to file
+         print     "$output_message";						#print to screen
+         exit $WARN;                                                   		#exit script
+      }                                                                 	#end of if block
+   }                                                                    	#end of if block
+   #
+   # Send an alert if there are unavailable tapes in the library
+   #
+   if ( $tsm_unavailabletapes >= $tsm_unavailable_crit ) {
+      $output_message = "$CHECK_NAME CRITICAL - There are $tsm_unavailabletapes unavailable tapes in the TSM library.  This means that TSM attempted to mount a tape that was supposed to be in the library, but the tape could not be found.  You can find the unavailable tapes with this command: SELECT VOLUME_NAME,STGPOOL_NAME FROM volumes WHERE ACCESS='UNAVAILABLE' \n";
+      print OUT "$output_message"; close OUT; 				#print to file
+      print     "$output_message";					#print to screen
+      exit $CRITICAL;                                                   #exit script
+   }                                                                    #end of if block
+   if ( $tsm_unavailabletapes >= $tsm_unavailable_warn ) {
+      $output_message = "$CHECK_NAME WARN - There are $tsm_unavailabletapes unavailable tapes in the TSM library.  This means that TSM attempted to mount a tape that was supposed to be in the library, but the tape could not be found.   You can find the unavailable tapes with this command: SELECT VOLUME_NAME,STGPOOL_NAME FROM volumes WHERE ACCESS='UNAVAILABLE' \n";
+      print OUT "$output_message"; close OUT; 				#print to file
+      print     "$output_message";						#print to screen
+      exit $WARN;                                                   	#exit script
+   }                                                                    #end of if block
+   #
+   # Send an alert if there are certain warnings in the TSM actlog
+   if ( $tsm_actlog_messages =~ /[a-zA-Z0-9]/ ) {			#only run this section if $tsm_actlog_messages contains text
+         # the $common_output_data variable already contains $tsm_actlog_messages
+         $output_message = "$CHECK_NAME WARN - issues found in TSM actlog. $common_output_data \n";
+         print OUT "$output_message"; close OUT; 				#print to file
+         print     "$output_message";						#print to screen
+         exit $WARN;                                                   	#exit script
+   }									#end of if block
+   #
+   # We should only get this far if there were no problems detected
+   #
+   $output_message = "$CHECK_NAME OK - $common_output_data \n";
+   print OUT "$output_message"; close OUT; 					#print to file
+   print     "$output_message";							#print to screen
+   exit $OK;									#exit script 
+}                                                       			#end of subroutine
+
+
+
+
+
+
+
+
+# --------------- main body of program ------------------------------------
+get_options;
+sanity_checks;
+check_for_output_file;
+check_for_multiple_instances;
+get_server_version;
+check_tsm_log_util;
+check_tsm_db_util;
+check_tsm_db_buffer_pool_hit_ratio;
+check_tsm_drives;
+check_tsm_paths;
+check_tsm_scratch_tapes;
+check_tape_library_free_slots;
+#check_tape_library_cleaning_tapes;
+check_tsm_actlog_entries;
+check_tsm_readonly_tapes;
+check_tsm_unavailable_tapes;
+check_client_schedules;
+check_admin_schedules;		
+print_output;
+
