@@ -46,6 +46,7 @@
 # 2018/06/22    njeffrey       		#Move all the alerts into the print_output subroutine.  This gathers all the info before sending an alert.
 # 2019/05/21    njeffrey       		#Script takes too long to run and times out.  Run as scheduled cron job and have nagios read an output file.
 # 2022/03/07    njeffrey       		#Add get_options subroutine
+# 2022/03/14    njeffrey       		#Update error checks in sanity_checks subroutine
 
 
 
@@ -391,7 +392,7 @@ sub check_for_output_file {
             # confirm the file was deleted
             if ( -e "$outputfile" ) {
                print "ERROR - Could not delete temporary file $outputfile - please check file permissions \n";
-               exit;
+               exit $WARN;
             }                                                                   #end of if block
          }                                                                      #end of if block
       }                                                                         #end of if block
@@ -406,14 +407,14 @@ sub check_for_output_file {
    # Confirm the outputfile is writeable so the current user can delete it
    if ( (-e "$outputfile") && (! -w "$outputfile") ) {
       print "ERROR - file $outputfile is readonly - please check file permissions.  File should be owned by the nagios userid. \n";
-      exit;
+      exit $WARN;
    }                                                                            #end of if block
    #
    # Confirm the outputfile is nonzero size
    if ( -z "$outputfile" ) {                                                    #see if a cron job has already provided the info we need
       unlink "$outputfile";                                                     #try to delete the file
       print "ERROR - file $outputfile is zero size - please check file permissions.  File should be owned by the nagios userid. \n";
-      exit;
+      exit $WARN;
    }                                                                            #end of if block
    #
    if ( -e "$outputfile" ) {                                                    #see if a cron job has already provided the info we need
@@ -423,10 +424,10 @@ sub check_for_output_file {
          $output_message = $_  if ( $_ =~ /[a-zA-Z]/);                          #get the content of the output file into a variable
       }                                                                         #end of while loop
       close OUT;                                                                #close filehandle
-      if ( $output_message !~ /log util/ ) {                                        #confirm output contains data similar to: log util
+      if ( $output_message !~ /$CHECK_NAME/ ) {                                 #confirm output contains data similar to: log util
          unlink "$outputfile";                                                  #try to delete the file
          print "ERROR - $outputfile does not contain valid data - please check file permissions.  File should be owned by the nagios userid. \n";
-         exit;                                                                  #exit script
+         exit $WARN;                                                            #exit script
       }
       # print the contents of the temporary file then exit the script
       print $output_message;                                                    #print the content of the output file
